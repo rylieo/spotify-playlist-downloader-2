@@ -1,0 +1,6 @@
+spotipy
+requests
+Pillow
+mutagen
+yt-dlp
+tqdm
