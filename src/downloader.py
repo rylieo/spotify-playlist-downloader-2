@@ -7,43 +7,29 @@ import random
 
 def download_audio(
     query,
-    output_wav,
+    output_mp3,
+    artist=None,
     duration_ms=None,
-    no_fallback=False,
     verbose=False,
     search_count=5,
-    use_official=True,
-    source="youtube",
     stop_event=None,
 ):
-    """Download audio for query into output_wav.
+    """Download audio for query into output_mp3 using yt-dlp executable.
 
     Arguments:
         query: search query string
-        output_wav: target wav path
+        output_mp3: target mp3 path
+        artist: expected artist name for verification (optional)
         duration_ms: target duration from Spotify in milliseconds (optional)
-        no_fallback: if True, do not attempt Python `yt_dlp` API fallback
         verbose: if True, show external tool output instead of capturing it
-        search_count: number of ytsearch results to consider when choosing candidate
-        use_official: boolean; kept for compatibility (query already includes official terms)
-        stop_event: optional threading.Event that, when set, requests cancellation
+        search_count: number of ytsearch results to consider
+        stop_event: optional threading.Event for cancellation
     """
-    """Download audio for query into output_wav.
-
-    Arguments:
-        query: search query string
-        output_wav: target wav path
-        duration_ms: target duration from Spotify in milliseconds (optional)
-        no_fallback: if True, do not attempt Python `yt_dlp` API fallback
-        verbose: if True, show external tool output instead of capturing it
-        search_count: number of ytsearch results to consider when choosing candidate
-        use_official: boolean; kept for compatibility (query already includes official terms)
-    """
-    outdir = os.path.dirname(output_wav)
+    outdir = os.path.dirname(output_mp3)
     if outdir:
         os.makedirs(outdir, exist_ok=True)
 
-    # Detect a JavaScript runtime (deno/node)
+    # Detect a JavaScript runtime (deno/node) for yt-dlp
     js_runtime = None
     for name in ("deno", "node"):
         path = shutil.which(name)
@@ -51,453 +37,249 @@ def download_audio(
             js_runtime = (name, path)
             break
 
-    # Helper: attempt using yt-dlp executable (subprocess)
-    def _run_with_exe():
-        yt_dlp_path = shutil.which("yt-dlp")
-        if yt_dlp_path is None:
-            return False, "yt-dlp executable not found"
-
-        cmd = [yt_dlp_path]
-        if js_runtime:
-            cmd += ["--js-runtimes", f"{js_runtime[0]}:{js_runtime[1]}"]
-
-        # Try search prefixes in order with YouTube Music as primary source
-        prefixes = ["ytmusicsearch1:", "ytsearch1:"]
-        cmd += [
-            "--no-playlist",
-            "-f",
-            "bestaudio/best",
-            "-x",
-            "--audio-format",
-            "mp3",
-            "--audio-quality",
-            "0",
-            "-o",
-            output_wav.replace('.wav', '.mp3'),
-            f"{prefixes[0]}{query}",
-        ]
-
-        # store prefixes for potential retry attempts
-        cmd_search_prefixes = prefixes
-
-        # Attempt initial prefix first, then fallback to the alternate prefix if available
-        tried = []
-        for prefix_attempt, search_prefix in enumerate(cmd_search_prefixes):
-            tried.append(search_prefix)
-            cmd[-1] = f"{search_prefix}{query}"
-            max_attempts = 3
-            delay = 1
-            for attempt in range(1, max_attempts + 1):
-                # Respect cooperative cancellation between attempts
-                if stop_event is not None and stop_event.is_set():
-                    return False, "cancelled by user"
-
-                try:
-                    capture_flag = not verbose
-                    stdout_pipe = subprocess.PIPE if capture_flag else None
-                    stderr_pipe = subprocess.PIPE if capture_flag else None
-                    candidate_timeout = 180  # seconds per candidate attempt
-                    start_time = time.time()
-                    proc = subprocess.Popen(cmd, stdout=stdout_pipe, stderr=stderr_pipe)
-
-                    # Wait with periodic checks to allow cancellation and enforce timeout
-                    while True:
-                        try:
-                            ret = proc.wait(timeout=1)
-                            break
-                        except subprocess.TimeoutExpired:
-                            # Check for cooperative cancellation
-                            if stop_event is not None and stop_event.is_set():
-                                try:
-                                    proc.kill()
-                                except Exception:
-                                    pass
-                                proc.wait()
-                                return False, "cancelled by user"
-
-                            # Enforce candidate-level timeout to avoid infinite hangs
-                            if time.time() - start_time > candidate_timeout:
-                                try:
-                                    proc.kill()
-                                except Exception:
-                                    pass
-                                try:
-                                    proc.wait(timeout=5)
-                                except Exception:
-                                    pass
-                                ret = -1
-                                stderr = f"yt-dlp executable timed out after {candidate_timeout}s"
-                                break
-                            continue
-
-                    # capture stderr if we need it
-                    stderr = ""
-                    if ret != 0:
-                        # if stderr already set by timeout, keep it
-                        if not stderr and stderr_pipe and proc.stderr:
-                            try:
-                                stderr = proc.stderr.read().decode(
-                                    "utf-8", errors="replace"
-                                )
-                            except Exception:
-                                stderr = f"yt-dlp failed with return code {ret}"
-                        elif not stderr:
-                            stderr = f"yt-dlp failed with return code {ret}"
-
-                    # Verify that a valid MP3 file was produced by yt-dlp
-                    candidate_paths = [output_wav.replace('.wav', '.mp3')]
-                    if not output_wav.lower().endswith(".wav"):
-                        candidate_paths.append(output_wav + ".mp3")
-
-                    found_good = False
-                    for p in candidate_paths:
-                        try:
-                            if os.path.exists(p) and os.path.getsize(p) > 1024:
-                                # If yt-dlp wrote a file with .mp3 extension, move it to the expected path
-                                if p != output_wav:
-                                    try:
-                                        shutil.move(p, output_wav)
-                                    except Exception:
-                                        pass
-                                found_good = True
-                                break
-                        except OSError:
-                            # ignore file access errors and treat as missing
-                            pass
-
-                    if found_good:
-                        return True, ""
-
-                    # yt-dlp reported success but produced no valid wav; clean any partials and continue attempts
-                    if verbose:
-                        print(
-                            f"yt-dlp run completed but no valid WAV found at {candidate_paths}"
-                        )
-                    for p in candidate_paths:
-                        try:
-                            if os.path.exists(p):
-                                os.remove(p)
-                        except Exception:
-                            pass
-
-                    # if there was an error, allow immediate prefix fallback for unavailable video
-                    if "This video is not available" in (
-                        stderr or ""
-                    ) or "ERROR: unable to obtain file audio codec" in (stderr or ""):
-                        if verbose:
-                            print(
-                                f"Prefix {search_prefix} failed: {(stderr or '').splitlines()[0]}"
-                            )
-                        break
-
-                    stderr = stderr or "yt-dlp produced no valid wav file"
-                    # continue to next attempt for this prefix
-                    if attempt < max_attempts:
-                        sleep_for = delay + random.uniform(0, delay)
-                        time.sleep(sleep_for)
-                        delay *= 2
-                        continue
-                    # exhausted attempts for this prefix, move to next prefix
-                    break
-
-                except Exception as e:
-                    stderr = str(e)
-                    # Remove any partial files left by yt-dlp for this attempt
-                    candidate_paths = [output_wav]
-                    if not output_wav.lower().endswith(".wav"):
-                        candidate_paths.append(output_wav + ".wav")
-                    for p in candidate_paths:
-                        try:
-                            if os.path.exists(p):
-                                os.remove(p)
-                        except Exception:
-                            pass
-
-                    if "No supported JavaScript runtime" in stderr or "EJS" in stderr:
-                        return False, stderr
-
-                    if (
-                        "This video is not available" in stderr
-                        or "ERROR: unable to obtain file audio codec" in stderr
-                    ):
-                        if verbose:
-                            print(
-                                f"Prefix {search_prefix} failed: {stderr.splitlines()[0]}"
-                            )
-                        break
-
-                    if attempt < max_attempts:
-                        sleep_for = delay + random.uniform(0, delay)
-                        time.sleep(sleep_for)
-                        delay *= 2
-                        continue
-                    # exhausted attempts for this prefix, move to next prefix
-                    break
-        # if we get here, all prefixes/attempts failed
-        return False, f"tried prefixes: {tried}; last error: {stderr}"
-
-    # Ensure ffprobe (part of ffmpeg) is available for postprocessing
-    ffprobe_path = shutil.which("ffprobe")
-
-    # First try executable if available
-    ok, msg = _run_with_exe()
-    if ok:
-        return
-
-    if no_fallback:
-        raise RuntimeError(f"yt-dlp executable failed: {msg}")
-
-    # If exe failed or not present, try Python yt_dlp API as a fallback
-    try:
-        import importlib.util
-
-        spec = importlib.util.find_spec("yt_dlp")
-    except Exception:
-        spec = None
-
-    if spec is None:
-        # No module fallback available; provide helpful message
-        hints = []
-        if "No supported JavaScript runtime" in msg or "EJS" in (msg or ""):
-            hints.append(
-                "yt-dlp needs a JavaScript runtime (deno or node). Install one (e.g. `winget install denoland.deno` or `winget install OpenJS.NodeJS.LTS`) or ensure it's in PATH."
-            )
-        if "ffprobe" in (msg or "") and not ffprobe_path:
-            hints.append(
-                "ffprobe not found. Install ffmpeg (which includes ffprobe) and add it to your PATH."
-            )
-        raise RuntimeError(
-            f"yt-dlp executable failed and Python module 'yt_dlp' not available. Last error: {msg}\nHints: {' | '.join(hints)}"
-        )
-
-    # Use yt_dlp Python API
-    try:
-        import yt_dlp
-
-        # prepare outtmpl so the postprocessor writes .wav as desired
-        if output_wav.lower().endswith(".wav"):
-            outtmpl = output_wav[:-4] + ".%(ext)s"
+    # Find yt-dlp command
+    yt_dlp_path = shutil.which("yt-dlp")
+    
+    # Fallback search in Python Scripts folder if not in PATH
+    if yt_dlp_path is None:
+        import sys
+        # Check standard Scripts folder relative to python
+        scripts_dir = os.path.join(os.path.dirname(sys.executable), "Scripts")
+        candidate = os.path.join(scripts_dir, "yt-dlp.exe")
+        if os.path.exists(candidate):
+            yt_dlp_path = candidate
         else:
-            outtmpl = output_wav + ".%(ext)s"
+            # Check user roaming Scripts folder (common on Windows)
+            user_scripts = os.path.join(os.environ.get("APPDATA", ""), "Python", f"Python{sys.version_info.major}{sys.version_info.minor}", "Scripts")
+            candidate = os.path.join(user_scripts, "yt-dlp.exe")
+            if os.path.exists(candidate):
+                yt_dlp_path = candidate
 
-        ydl_opts = {
-            "format": "bestaudio/best",
-            "outtmpl": outtmpl.replace('.wav', '.mp3'),
-            "noplaylist": True,
-            "quiet": not verbose,
-            "no_warnings": not verbose,
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "0",
-                }
-            ],
-        }
+    # Base command: if still not found as exe, use python -m yt_dlp (as a process)
+    if yt_dlp_path:
+        cmd = [yt_dlp_path]
+    else:
+        # Final fallback: use the python module as an executable (subprocess)
+        # This honors "use only executable" as it runs a separate process CLI
+        cmd = [sys.executable, "-m", "yt_dlp"]
 
-        # Use yt_dlp Python API to search multiple candidates and choose the best by duration/title
-        try:
-            last_exc = None
-            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
-                # Always try YouTube Music as primary source, then YouTube as fallback
-                prefixes = ["ytmusicsearch", "ytsearch"]
-                entries = []
-                last_search_err = None
-                for p in prefixes:
-                    try:
-                        search_query = f"{p}{search_count}:{query}"
-                        if verbose:
-                            print(f"Searching with prefix {p}: {search_query}")
-                        info = ydl.extract_info(search_query, download=False)
-                        entries = info.get("entries") or []
-                        if entries:
-                            break
-                    except Exception as e:
-                        last_search_err = e
-                        if verbose:
-                            print(f"Search with prefix {p} failed: {e}")
-                        continue
+    if js_runtime:
+        cmd += ["--js-runtimes", f"{js_runtime[0]}:{js_runtime[1]}"]
 
-            if not entries:
-                raise RuntimeError(
-                    f"No search results from yt_dlp API (tried prefixes {prefixes}): {last_search_err}"
-                )
+    # Priority: YT Music (via direct URL search to avoid 'unsupported scheme' errors on some systems)
+    # followed by regular YouTube search
+    prefixes = ["https://music.youtube.com/search?q=", "ytsearch"]
+    
+    # query is "Title Artist" from build_query
+    query_variants = [query]
+    
+    # Generate variations
+    clean_q = query.lower().replace("official audio", "").strip()
+    
+    if artist:
+        # 1. "Artist - Title" (Standard)
+        # 2. "Title - Artist" (Reversed)
+        # 3. "Title" only (Aggressive fallback)
+        clean_artist = artist.lower()
+        title_only = clean_q.replace(clean_artist, "").replace("-", " ").strip()
+        
+        # Ensure we don't add empty or identical variants
+        variants = [
+            f"{artist} - {title_only}",
+            f"{title_only} - {artist}",
+            title_only,
+            f"{title_only} {artist}"
+        ]
+        
+        for v in variants:
+            if v and len(v) > 2 and v not in query_variants:
+                query_variants.append(v)
+    else:
+        # Just try with/without official audio
+        if "official audio" in query.lower():
+            query_variants.append(clean_q)
+        else:
+            query_variants.append(f"{query} official audio")
 
-            target_s = duration_ms / 1000.0 if duration_ms else None
+    last_stderr = ""
 
-            # Extract artist from query for comparison
-            # Assuming query format is "title artist official audio" or similar
-            query_parts = query.lower().split()
-            artist_from_query = ""
-            if len(query_parts) > 2:
-                # Take the last few words as potential artist name
-                artist_words = query_parts[-3:]  # Last 3 words as potential artist
-                artist_from_query = " ".join(artist_words)
+    target_s = duration_ms / 1000.0 if duration_ms else None
 
-            def score_entry(entry, idx):
-                dur = entry.get("duration")
-                if dur is None:
-                    dur_score = float("inf")
-                elif target_s is None:
-                    dur_score = 0
-                else:
-                    dur_score = abs(dur - target_s)
+    unique_candidates = {}
+    
+    for search_prefix in prefixes:
+        for q_var in query_variants:
+            # Construct search command
+            if search_prefix.startswith("http"):
+                # URL-based search (YT Music workaround)
+                import urllib.parse
+                encoded_q = urllib.parse.quote(q_var)
+                search_query = f"{search_prefix}{encoded_q}"
+            else:
+                # Regular prefix search
+                search_query = f"{search_prefix}:{q_var}"
 
-                title = (entry.get("title") or "").lower()
-                uploader = (entry.get("uploader") or "").lower()
-
-                # prefer titles that contain the track title words
-                title_match = 0
-                if query:
-                    q = query.split(" ")
-                    # count how many query words appear in title
-                    title_match = -sum(
-                        1 for w in q if len(w) > 2 and w.lower() in title
-                    )
-
-                # additional scoring based on uploader/artist match
-                uploader_match = 0
-                if artist_from_query and len(artist_from_query) > 2:
-                    # penalize if uploader doesn't contain artist name
-                    if artist_from_query not in uploader:
-                        uploader_match = 1  # small penalty
-
-                # check if title contains common non-matching indicators
-                non_matching_indicators = ["remix", "live", "acoustic", "instrumental", "cover", "version"]
-                indicator_penalty = 0
-                for indicator in non_matching_indicators:
-                    if indicator in title and indicator not in query.lower():
-                        indicator_penalty += 2  # penalty for potential mismatch
-
-                return (dur_score, uploader_match, title_match, indicator_penalty, idx)
-
-            # Score all entries and sort
-            scored = [(score_entry(e, i), e) for i, e in enumerate(entries)]
-            scored.sort()
-
-            if not scored:
-                raise RuntimeError("No search results from yt_dlp API")
-
-            # Try candidates in score order until one downloads successfully
-            download_errors = []
-            for rank, (s, entry) in enumerate(scored, start=1):
-                # Respect cooperative cancellation between candidates
-                if stop_event is not None and stop_event.is_set():
-                    return
-
-                out_url = entry.get("webpage_url") or entry.get("url")
-                if not out_url:
-                    download_errors.append((entry.get("id"), "no url"))
+            search_cmd = cmd + [
+                "--dump-json", 
+                "--flat-playlist", 
+                "--playlist-items", f"1-{search_count}",
+                search_query
+            ]
+            
+            try:
+                proc = subprocess.run(search_cmd, capture_output=True, check=False, timeout=45)
+                
+                if proc.returncode != 0:
+                    last_stderr = proc.stderr.decode("utf-8", errors="replace")
                     continue
 
-                # Check duration match before attempting download
-                if target_s and entry.get("duration"):
-                    tol = max(5, int(target_s * 0.08))  # tolerance is max of 5 seconds or 8% of track duration (tighter tolerance)
-                    duration_diff = abs(entry.get("duration") - target_s)
-                    if duration_diff > tol:
-                        if verbose:
-                            print(
-                                f"Candidate {rank} duration differs by {duration_diff:.1f}s (>{tol:.1f}s tolerance): {entry.get('duration')} vs {target_s}s, skipping"
-                            )
-                        continue  # Skip this candidate if duration mismatch is too large
-                    elif verbose:
-                        print(
-                            f"Candidate {rank} duration match: {entry.get('duration')}s vs {target_s}s (tolerance: {tol:.1f}s)"
-                        )
-
-                if verbose:
-                    print(
-                        f"Trying candidate {rank}/{len(scored)}: {entry.get('title')} ({out_url})"
-                    )
-
-                # attempt download for this candidate
-                max_attempts = 2
-                delay = 1
-                for attempt in range(1, max_attempts + 1):
-                    if stop_event is not None and stop_event.is_set():
-                        return
-
+                # Parse candidates from JSON lines
+                import json
+                for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
+                    if not line.strip().startswith("{"): continue
                     try:
-                        expected_mp3 = outtmpl.replace("%(ext)s", "mp3").replace('.wav', '.mp3')
-                        # remove any stale/partial expected mp3 before attempting
-                        try:
-                            if os.path.exists(expected_mp3):
-                                os.remove(expected_mp3)
-                        except Exception:
-                            pass
+                        data = json.loads(line)
+                        if "id" in data:
+                            unique_candidates[data["id"]] = data
+                    except:
+                        continue
+            except Exception as e:
+                last_stderr = str(e)
+                continue
 
-                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                            # run download and periodically check for cancellation
-                            done = False
+        # (Strict Phase Separation removed to allow global comparison)
 
-                            def _run_and_monitor():
-                                try:
-                                    ydl.download([out_url])
-                                finally:
-                                    nonlocal done
-                                    done = True
+    if not unique_candidates:
+        return False
 
-                            import threading
+    # Scoring candidates
+    scored = []
+    candidates = list(unique_candidates.values())
+    
+    for entry in candidates:
+        dur = entry.get("duration")
+        if dur is None:
+            dur_score = 100
+        elif target_s is None:
+            dur_score = 0
+        else:
+            dur_score = abs(dur - target_s)
 
-                            th = threading.Thread(target=_run_and_monitor, daemon=True)
-                            th.start()
+        title = (entry.get("title") or "").lower()
+        uploader = (entry.get("uploader") or "").lower()
+        channel = (entry.get("channel") or "").lower()
+        is_verified = entry.get("channel_is_verified") or False
 
-                            # wait for the thread but poll for stop_event and enforce timeout
-                            candidate_timeout = 180  # seconds per candidate
-                            start_time = time.time()
-                            while th.is_alive():
-                                th.join(timeout=1)
-                                if stop_event is not None and stop_event.is_set():
-                                    # we can't forcibly stop ydl.download, but we can return early
-                                    # allow the background thread to finish/cleanup on its own
-                                    download_errors.append(
-                                        (entry.get("id"), "cancelled")
-                                    )
-                                    return
-                                if time.time() - start_time > candidate_timeout:
-                                    if verbose:
-                                        print(
-                                            f"Candidate {rank} timed out after {candidate_timeout}s"
-                                        )
-                                    download_errors.append((entry.get("id"), "timeout"))
-                                    # stop waiting and move to next candidate
-                                    break
+        # Penalize non-matching indicators
+        # Added "live", "concert" etc to avoid live versions
+        indicators = ["remix", "live", "acoustic", "instrumental", "cover", "karaoke", "sped up", "slowed", "concert", "perform", "tour", "video", "official video", "mv"]
+        penalty = 0
+        for ind in indicators:
+            if ind in title and ind not in query.lower():
+                penalty += 100 
 
-                        # check that expected mp3 file exists and is not empty
-                        if (
-                            os.path.exists(expected_mp3)
-                            and os.path.getsize(expected_mp3) > 1024
-                        ):
-                            # Move the downloaded MP3 to the expected WAV path to maintain consistency
-                            shutil.move(expected_mp3, output_wav)
-                            return
+        # Title Match
+        title_penalty = 0
+        if artist:
+            clean_artist = artist.lower()
+            base_clean_title = query.lower().replace("official audio", "").replace(clean_artist, "").strip()
+            q_words = [w for w in base_clean_title.split() if len(w) > 2]
+            if not q_words: q_words = [w for w in base_clean_title.split() if w]
+            
+            found_words = sum(1 for w in q_words if w in title)
+            if q_words and found_words == 0:
+                title_penalty = 180 
+            else:
+                title_penalty = (len(q_words) - found_words) * 35
 
-                        # else treat as failure and try next candidate
-                        download_errors.append(
-                            (entry.get("id"), "no valid wav produced")
-                        )
-                        break
+        # Artist/Uploader Check
+        artist_score = 45 
+        if artist:
+            a_lower = artist.lower()
+            
+            # TOPIC SUPREMACY: If it is a Topic channel, it is the highest quality audio (Source of Truth)
+            if f"{a_lower} - topic" in uploader or "topic" in uploader or "release - topic" in uploader:
+                artist_score = -80 # Massive Bonus for Topic (Beats everything)
+            elif a_lower == uploader or a_lower == channel:
+                 # Official Artist Channel is good, but videos might have intros
+                artist_score = -30
+            elif a_lower in uploader or a_lower in channel or uploader in a_lower:
+                artist_score = -20
+            elif is_verified:
+                artist_score = -20
+            
+            if artist_score > 0 and len(uploader) > 3 and uploader in title:
+                artist_score += 70
 
-                    except Exception as e:
-                        download_errors.append((entry.get("id"), str(e)))
-                        if attempt < max_attempts:
-                            sleep_for = delay + random.uniform(0, delay)
-                            time.sleep(sleep_for)
-                            delay *= 2
-                            continue
-                        # move to next candidate
-                        break
+        # Near-perfect duration bonus
+        perfect_dur_bonus = 0
+        if target_s and dur:
+            diff = abs(dur - target_s)
+            if diff < 4.0:
+                perfect_dur_bonus = -60 
+            elif diff < 8.0:
+                perfect_dur_bonus = -25
 
-            # If we reach here, none of the candidates worked
-            raise RuntimeError(f"All candidate downloads failed: {download_errors}")
-        except Exception as e:
-            # if Python API fails, we'll fall back to the executable flow below (unless no_fallback)
-            last_exc = e
-            if no_fallback:
-                raise RuntimeError(f"yt_dlp API search/download failed: {e}") from e
-            # otherwise, continue to try executable-based download
+        # Total score
+        total_score = penalty + artist_score + title_penalty + perfect_dur_bonus + (dur_score * 10.0) # Increased duration weight
+        scored.append((total_score, entry))
 
-    except Exception as e:
-        raise RuntimeError(
-            f"Failed to download using yt-dlp (exe) and yt_dlp API fallback. Last error: {msg if not spec else str(e)}"
-        ) from e
+    scored.sort(key=lambda x: x[0])
+    
+    # Try top candidates until success
+    for total_score, entry in scored:
+        if stop_event is not None and stop_event.is_set():
+            raise KeyboardInterrupt("Cancelled by user")
+
+        dur = entry.get("duration")
+        if target_s and dur:
+            diff = abs(dur - target_s)
+            
+            # STRICT DURATION MATCHING requested by user ("100% same")
+            # We allow a tiny margin (3s) for platform differences (silence padding)
+            # Anything beyond that is likely a different version (video intro, extended mix, etc.)
+            tolerance = 3.0
+            
+            # If we are desperate (score is bad), we might relax slightly, but barely
+            if total_score > 50: 
+                tolerance = 5.0
+                
+            if diff > tolerance:
+                if verbose:
+                    print(f"Skipping {entry.get('title')} - Duration diff {diff:.1f}s > {tolerance:.1f}s")
+                continue
+
+        video_url = entry.get("url") or entry.get("webpage_url") or entry.get("id")
+        if not video_url: continue
+
+        if verbose:
+            print(f"Chosen candidate (Score: {total_score:.1f}): {entry.get('title')} | Uploader: {entry.get('uploader')}")
+
+        download_cmd = cmd + [
+            "--no-playlist",
+            "-f", "bestaudio/best",
+            "-x", "--audio-format", "mp3", "--audio-quality", "192k",
+            "-o", output_mp3,
+            video_url
+        ]
+        
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            try:
+                p_dl = subprocess.Popen(download_cmd, stdout=subprocess.PIPE if not verbose else None, stderr=subprocess.PIPE if not verbose else None)
+                ret = p_dl.wait(timeout=180)
+                
+                # Cleanup intermediate junk
+                base_p = os.path.splitext(output_mp3)[0]
+                for ext in [".m4a", ".webm", ".f140", ".f251", ".part"]:
+                    if os.path.exists(base_p + ext):
+                        try: os.remove(base_p + ext)
+                        except: pass
+
+                if ret == 0 and os.path.exists(output_mp3) and os.path.getsize(output_mp3) > 1024:
+                    return # Success
+            except:
+                continue
+                continue
+
+    raise RuntimeError(f"Download failed for {query}. Last error: {last_stderr}")
