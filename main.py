@@ -78,6 +78,8 @@ def process_track(
             mp3,
             artist=t.get("artist"),
             duration_ms=t.get("duration_ms"),
+            isrc=t.get("isrc"),
+            album=t.get("album"),
             verbose=verbose,
             search_count=search_count,
             stop_event=stop_event,

@@ -12,7 +12,8 @@ def fetch_playlist(playlist_url, config_path="config/spotify.json"):
     )
 
     # Use pagination to fetch all items (Spotify returns pages, ~100 items per page)
-    results = sp.playlist_items(playlist_url, fields="items.track,next,total")
+    # Added external_ids to fetch ISRC
+    results = sp.playlist_items(playlist_url, fields="items.track(name,artists,album,duration_ms,external_ids),next,total")
     tracks = []
 
     while results and results.get("items"):
@@ -31,6 +32,7 @@ def fetch_playlist(playlist_url, config_path="config/spotify.json"):
                     "duration_ms": t.get("duration_ms", 0),
                     "track_number": len(tracks) + 1,
                     "genre": "Unknown",
+                    "isrc": t.get("external_ids", {}).get("isrc"),
                     "cover_url": (
                         t["album"]["images"][0]["url"]
                         if t.get("album") and t["album"].get("images")
