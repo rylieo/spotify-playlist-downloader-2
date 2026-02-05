@@ -1,6 +1,7 @@
-spotipy
+ytmusicapi
 requests
-Pillow
 mutagen
+spotipy
 yt-dlp
+Pillow
 tqdm

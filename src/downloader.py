@@ -4,6 +4,8 @@ import shutil
 import time
 import random
 
+from .smart_resolver import smart_resolve_track
+
 
 def download_audio(
     query,
@@ -12,6 +14,7 @@ def download_audio(
     duration_ms=None,
     isrc=None,
     album=None,
+    title=None,
     verbose=False,
     search_count=5,
     stop_event=None,
@@ -25,6 +28,7 @@ def download_audio(
         duration_ms: target duration from Spotify in milliseconds (optional)
         isrc: ISRC code from Spotify (optional, for 100% match)
         album: Album name from Spotify (optional, for scoring)
+        title: Track title from Spotify (optional, for ytmusic search)
         verbose: if True, show external tool output instead of capturing it
         search_count: number of ytsearch results to consider
         stop_event: optional threading.Event for cancellation
@@ -65,10 +69,10 @@ def download_audio(
     prefixes = ["https://music.youtube.com/search?q=", "ytsearch"]
     query_variants = [query]
     
-    clean_q = query.lower().replace("official audio", "").strip()
+    clean_q = query.lower().replace("official audio", "").strip() if query else ""
     
     if artist:
-        clean_artist = artist.lower()
+        clean_artist = artist.lower() if artist else ""
         title_only = clean_q.replace(clean_artist, "").replace("-", " ").strip()
         variants = [
             f"{artist} - {title_only}",
@@ -80,10 +84,48 @@ def download_audio(
             if v and len(v) > 2 and v not in query_variants:
                 query_variants.append(v)
     
+    # Try Smart Resolver (ISRC-First dengan fallback)
+    track_info = {
+        'title': title or '',
+        'artist': artist,
+        'album': album,
+        'duration_ms': duration_ms,
+        'isrc': isrc
+    }
+    
+    ytmusic_result = smart_resolve_track(track_info, verbose=False)  # Disable verbose
+    
+    if ytmusic_result and verbose:
+        confidence = ytmusic_result.get('confidence', 0)
+        print(f"RESOLVED with {confidence:.2f} confidence: {ytmusic_result.get('title')}")
+    
     last_stderr = ""
     target_s = duration_ms / 1000.0 if duration_ms else None
     unique_candidates = {}
     
+    # Add Smart Resolver result (highest priority - ISRC-First)
+    if ytmusic_result:
+        video_id = ytmusic_result.get('video_id')
+        if video_id:
+            # Convert smart resolver result to yt-dlp format
+            candidate = {
+                'id': video_id,
+                'title': ytmusic_result.get('title', ''),
+                'uploader': ', '.join(ytmusic_result.get('artists', [])),
+                'duration': ytmusic_result.get('duration', 0),
+                'isrc': ytmusic_result.get('isrc', ''),
+                'album': ytmusic_result.get('album', ''),
+                'url': ytmusic_result.get('url', ''),
+                'confidence': ytmusic_result.get('confidence', 0),
+                'from_smart_resolver': True,
+                'resolved': True
+            }
+            unique_candidates[video_id] = candidate
+            if verbose:
+                confidence = ytmusic_result.get('confidence', 0)
+                print(f"Added SMART RESOLVED track: {ytmusic_result.get('title')} (confidence: {confidence:.2f})")
+    
+    # Traditional yt-dlp search as fallback
     for search_prefix in prefixes:
         for q_var in query_variants:
             if search_prefix.startswith("http"):
@@ -112,12 +154,14 @@ def download_audio(
                     try:
                         data = json.loads(line)
                         if "id" in data:
-                            # Check for ISRC match early if available
-                            cand_isrc = data.get("isrc")
-                            if isrc and cand_isrc and isrc.lower() == cand_isrc.lower():
-                                data["isrc_match"] = True
-                                if verbose: print(f"DEBUG: ISRC MATCH found in search results for {data['id']}")
-                            unique_candidates[data["id"]] = data
+                            # Don't overwrite smart resolver results
+                            if data["id"] not in unique_candidates or not unique_candidates[data["id"]].get("from_smart_resolver"):
+                                # Check for ISRC match early if available
+                                cand_isrc = data.get("isrc")
+                                if isrc and cand_isrc and (isrc.lower() if isrc else "") == (cand_isrc.lower() if cand_isrc else ""):
+                                    data["isrc_match"] = True
+                                    if verbose: print(f"DEBUG: ISRC MATCH found in search results for {data['id']}")
+                                unique_candidates[data["id"]] = data
                     except:
                         continue
             except Exception as e:
@@ -128,9 +172,15 @@ def download_audio(
         return False
 
     def get_score(cand_entry):
-        # ISRC Match priority
+        # SMART RESOLVER MATCH - ABSOLUTE HIGHEST PRIORITY (ISRC-First)
+        if cand_entry.get("from_smart_resolver") and cand_entry.get("resolved"):
+            confidence = cand_entry.get("confidence", 0)
+            if verbose: print(f"SMART RESOLVER MATCH - Highest priority for {cand_entry.get('title')} (confidence: {confidence:.2f})")
+            return -9999999, 0  # Absolute highest priority
+        
+        # ISRC MATCH - HIGH PRIORITY
         if cand_entry.get("isrc_match"):
-            return -99999, 0 # Penalty 0
+            if verbose: print(f"DEBUG: ISRC MATCH - High priority for {cand_entry.get('title')}")
 
         dur = cand_entry.get("duration")
         if dur is None:
@@ -149,8 +199,8 @@ def download_audio(
         indicators = ["remix", "live", "acoustic", "instrumental", "cover", "karaoke", "sped up", "slowed", "concert", "perform", "tour", "video", "official video", "mv"]
         penalty = 0
         for ind in indicators:
-            if ind in title and ind not in query.lower():
-                is_official_source = artist and (artist.lower() in uploader or artist.lower() in channel)
+            if ind in title and ind not in (query.lower() if query else ""):
+                is_official_source = artist and (artist.lower() if artist else "" in uploader or (artist.lower() if artist else "" in channel))
                 if (ind in ["video", "official video", "mv"]) and (is_official_source or is_verified):
                     penalty += 40 
                 else:
@@ -165,8 +215,8 @@ def download_audio(
 
             # clean_artist is defined in the outer scope, but for clarity and self-containment
             # within the function, we can re-derive it or pass it. Let's re-derive.
-            local_clean_artist = artist.lower()
-            q_title_part = query.lower().replace(local_clean_artist, "").strip()
+            local_clean_artist = artist.lower() if artist else ""
+            q_title_part = (query.lower() if query else "").replace(local_clean_artist, "").strip()
             q_words = get_words(q_title_part)
             t_words = get_words(title)
 
@@ -182,7 +232,7 @@ def download_audio(
 
         artist_score = 45 
         if artist:
-            a_lower = artist.lower()
+            a_lower = artist.lower() if artist else ""
             if f"{a_lower} - topic" in uploader or "topic" in uploader or "release - topic" in uploader:
                 artist_score = -150 
             elif a_lower == uploader or a_lower == channel:
@@ -197,8 +247,15 @@ def download_audio(
 
         album_bonus = 0
         if album and cand_album:
-            if album.lower() in cand_album or cand_album in album.lower():
+            if (album.lower() if album else "" in cand_album or cand_album in (album.lower() if album else "")):
                 album_bonus = -50
+
+        # PRIORITIZE SMART RESOLVER RESULTS (ISRC-First)
+        smart_resolver_bonus = 0
+        if entry.get("from_smart_resolver"):
+            smart_resolver_bonus = -1000  # Highest priority
+        elif entry.get("isrc_match"):
+            smart_resolver_bonus = -500   # High priority for ISRC matches
 
         perfect_dur_bonus = 0
         if target_s and dur:
@@ -208,7 +265,7 @@ def download_audio(
             elif diff < 5.0:
                 perfect_dur_bonus = -30
 
-        total_score = penalty + artist_score + title_penalty + perfect_dur_bonus + album_bonus + (dur_score * 15.0)
+        total_score = penalty + artist_score + title_penalty + perfect_dur_bonus + album_bonus + smart_resolver_bonus + (dur_score * 15.0)
         return total_score, title_penalty
 
     scored = []
@@ -243,7 +300,7 @@ def download_audio(
                     entry.update(full_data) # Update with ALL new metadata
                     # Re-check ISRC after full fetch
                     cand_isrc = full_data.get("isrc")
-                    if isrc and cand_isrc and isrc.lower() == isrc.lower():
+                    if isrc and cand_isrc and (isrc.lower() if isrc else "") == (cand_isrc.lower() if cand_isrc else ""):
                         entry["isrc_match"] = True
                         if verbose: print(f"DEBUG: ISRC MATCH confirmed after full fetch for {video_id}!")
             except:
@@ -254,31 +311,27 @@ def download_audio(
         dur = entry.get("duration")
         uploader = (entry.get("uploader") or "").lower()
 
-        if target_s:
-            if dur:
-                diff = abs(dur - target_s)
-                tolerance = 3.0
-                if total_score < 0: # ISRC or Verified Topic match
-                    tolerance = 15.0
-                elif total_score < 350: # Strong match
-                    tolerance = 10.0
-                elif total_score < 600: # Moderate match
-                    tolerance = 5.0
-                else: # Poor match
-                    tolerance = 1.0 # Extremely strict
-                
-                # HARD REJECT
-                if title_penalty > 150 and total_score > 300:
-                    if verbose: print(f"Skipping {entry.get('title')} - Title mismatch too high ({title_penalty})")
-                    continue
-                
-                if diff > tolerance:
-                    if verbose: print(f"Skipping {entry.get('title')} - Duration diff {diff:.1f}s > {tolerance:.1f}s")
-                    continue
-            else:
-                if total_score > -1000:
-                    if verbose: print(f"Skipping {entry.get('title')} - Still no duration info")
-                    continue
+        # Additional validation for YTMusic results
+        if entry.get("from_ytmusic") and entry.get("is_song"):
+            # YTMusic results are pre-validated, but still check duration
+            if target_s:
+                dur = entry.get("duration")
+                if dur:
+                    duration_diff = abs(dur - target_s)
+                    # Even for YTMusic, reject if duration is very different
+                    if duration_diff > 15.0:  # More than 15 seconds different
+                        if verbose: print(f"Skipping YTMusic result {entry.get('title')} - Duration diff too high: {duration_diff:.1f}s")
+                        continue
+        else:
+            # Traditional search results need very strict validation
+            if target_s:
+                if dur:
+                    diff = abs(dur - target_s)
+                    
+                    # VERY STRICT: Reject if duration is more than 15 seconds different
+                    if diff > 15.0:
+                        if verbose: print(f"Skipping {entry.get('title')} - Duration diff {diff:.1f}s > 15.0s limit")
+                        continue
 
         video_url = entry.get("url") or entry.get("webpage_url") or video_id
         if not video_url: continue
