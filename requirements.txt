@@ -1,7 +1,0 @@
-ytmusicapi
-requests
-mutagen
-spotipy
-yt-dlp
-Pillow
-tqdm
