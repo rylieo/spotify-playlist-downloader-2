@@ -356,8 +356,8 @@ def main():
         "-w",
         "--workers",
         type=int,
-        default=1,
-        help="download worker threads (default: 1)",
+        default=3,
+        help="download worker threads (default: 3)",
     )
     parser.add_argument("--quiet", action="store_true", help="less verbose output")
     parser.add_argument(

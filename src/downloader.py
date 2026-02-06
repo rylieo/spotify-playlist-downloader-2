@@ -83,7 +83,7 @@ def download_audio(
     # cmd += ["--remote-components", "ejs:github"]
     
     # Force audio format selection to avoid downloading only images
-    cmd += ["--extract-audio", "--audio-format", "mp3", "--audio-quality", "0"]
+    cmd += ["--extract-audio", "--audio-format", "mp3", "--audio-quality", "192k"]
     
     # Add fallback option without JavaScript challenge
     cmd += ["--no-check-certificate"]
@@ -355,7 +355,8 @@ def download_audio(
                 try:
                     # Build download command
                     download_cmd = cmd + [
-                        "-x", "--audio-format", "mp3", "--audio-quality", "0",
+                        "-f", "bestaudio/best",
+                        "-x", "--audio-format", "mp3", "--audio-quality", "192k",
                         "-o", output_mp3,
                         f"https://music.youtube.com/watch?v={video_id}"
                     ]
