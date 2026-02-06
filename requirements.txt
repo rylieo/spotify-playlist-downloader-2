@@ -1,0 +1,13 @@
+# Core dependencies
+ytmusicapi
+requests
+mutagen
+spotipy
+yt-dlp
+Pillow
+tqdm
+
+# Additional dependencies for enhanced functionality
+python-dotenv  # For environment variables (optional)
+colorama  # For colored terminal output (optional)
+ffmpeg-python  # For audio encoding (optional)
