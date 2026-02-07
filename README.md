@@ -1,3 +1,7 @@
+## Preview
+
+![preview](https://i.imgur.com/NgbOa6J.png)
+
 ## File Konfigurasi yang Diperlukan
 
 ### 1. `config/spotify.json`
